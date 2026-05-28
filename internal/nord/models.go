@@ -1,12 +1,12 @@
 package nord
 
 type RawServer struct {
-	Station        string          `json:"station"`
-	Hostname       string          `json:"hostname"`
-	Load           int             `json:"load"`
-	Locations      []Location      `json:"locations"`
-	Specifications []Specification `json:"specifications"`
-	Technologies   []Technology    `json:"technologies"`
+	Station      string       `json:"station"`
+	Hostname     string       `json:"hostname"`
+	Load         int          `json:"load"`
+	Locations    []Location   `json:"locations"`
+	Groups       []Group      `json:"groups"`
+	Technologies []Technology `json:"technologies"`
 }
 
 type Location struct {
@@ -23,13 +23,8 @@ type City struct {
 	Name string `json:"name"`
 }
 
-type Specification struct {
-	Identifier string      `json:"identifier"`
-	Values     []SpecValue `json:"values"`
-}
-
-type SpecValue struct {
-	Value string `json:"value"`
+type Group struct {
+	Identifier string `json:"identifier"`
 }
 
 type Technology struct {
@@ -46,8 +41,10 @@ type ProcessedServer struct {
 	City           string
 	LowCode        string
 	Number         string
+	NumVal         int
 	KeyIndex       int
 	Load           int
+	GroupMask      int
 	RawCountryName string
 	RawCityName    string
 	DedupSuffix    string
@@ -62,6 +59,7 @@ type ServerNode struct {
 	Load        int
 	IpNum       uint32
 	KeyIdx      int
+	GroupMask   int
 	HName       string
 	DedupSuffix string
 }

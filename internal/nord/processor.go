@@ -1,6 +1,7 @@
 package nord
 
 import (
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,49 +41,6 @@ func extractNumber(s string) string {
 		return ""
 	}
 	return s[start:end]
-}
-
-func validateVersion(v string) bool {
-	dot1 := -1
-	for i := 0; i < len(v); i++ {
-		if v[i] == '.' {
-			dot1 = i
-			break
-		}
-	}
-	if dot1 <= 0 {
-		return false
-	}
-	major, err := strconv.Atoi(v[:dot1])
-	if err != nil {
-		return false
-	}
-	if major > 2 {
-		return true
-	}
-	if major < 2 {
-		return false
-	}
-
-	rest := v[dot1+1:]
-	dot2 := -1
-	for i := 0; i < len(rest); i++ {
-		if rest[i] == '.' {
-			dot2 = i
-			break
-		}
-	}
-	var minorStr string
-	if dot2 == -1 {
-		minorStr = rest
-	} else {
-		minorStr = rest[:dot2]
-	}
-	minor, err := strconv.Atoi(minorStr)
-	if err != nil {
-		return false
-	}
-	return minor >= 1
 }
 
 func normalizeName(s string) string {
@@ -169,18 +127,6 @@ func Process(rawServers []RawServer) ([]byte, error) {
 			continue
 		}
 
-		version := "0.0.0"
-		for _, spec := range server.Specifications {
-			if spec.Identifier == "version" && len(spec.Values) > 0 {
-				version = spec.Values[0].Value
-				break
-			}
-		}
-
-		if !validateVersion(version) {
-			continue
-		}
-
 		publicKey := ""
 		for _, tech := range server.Technologies {
 			for _, meta := range tech.Metadata {
@@ -206,30 +152,64 @@ func Process(rawServers []RawServer) ([]byte, error) {
 			keyMap[publicKey] = keyIdx
 		}
 
-		lowCountryCode := getLowCode(loc.Country.Code)
-		serverNumber := extractNumber(server.Hostname)
-		if serverNumber == "" {
-			serverNumber = "wg"
+		groupMask := 0
+		for _, g := range server.Groups {
+			switch g.Identifier {
+			case "legacy_standard":
+				groupMask |= 1
+			case "legacy_p2p":
+				groupMask |= 2
+			case "legacy_dedicated_ip":
+				groupMask |= 4
+			case "legacy_onion_over_vpn":
+				groupMask |= 8
+			case "legacy_double_vpn":
+				groupMask |= 16
+			}
 		}
 
-		ipNum := ipToNumeric(server.Station)
+		lowCountryCode := getLowCode(loc.Country.Code)
 		prefix := lowCountryCode
 		if prefix == "gb" {
 			prefix = "uk"
 		}
-		expectedHostname := prefix + serverNumber + ".nordvpn.com"
+
+		extractedNumStr := extractNumber(server.Hostname)
+		numVal := 0
+		if extractedNumStr != "" {
+			numVal, _ = strconv.Atoi(extractedNumStr)
+		}
+
+		serverNumber := ""
 		hName := ""
-		if server.Hostname != expectedHostname {
+
+		if strings.HasSuffix(server.Hostname, ".nordvpn.com") {
+			base := strings.TrimSuffix(server.Hostname, ".nordvpn.com")
+			if extractedNumStr != "" && prefix+extractedNumStr == base {
+				serverNumber = extractedNumStr
+			} else {
+				serverNumber = base
+			}
+		} else {
+			if extractedNumStr != "" {
+				serverNumber = extractedNumStr
+			} else {
+				serverNumber = "wg"
+			}
 			hName = server.Hostname
 		}
+
+		ipNum := ipToNumeric(server.Station)
 
 		processed = append(processed, ProcessedServer{
 			Country:        getNormalized(loc.Country.Name),
 			City:           getNormalized(loc.Country.City.Name),
 			LowCode:        lowCountryCode,
 			Number:         serverNumber,
+			NumVal:         numVal,
 			KeyIndex:       keyIdx,
 			Load:           server.Load,
+			GroupMask:      groupMask,
 			RawCountryName: loc.Country.Name,
 			RawCityName:    loc.Country.City.Name,
 			IpNum:          ipNum,
@@ -244,10 +224,8 @@ func Process(rawServers []RawServer) ([]byte, error) {
 		if processed[i].City != processed[j].City {
 			return processed[i].City < processed[j].City
 		}
-		numA, errA := strconv.Atoi(processed[i].Number)
-		numB, errB := strconv.Atoi(processed[j].Number)
-		if errA == nil && errB == nil {
-			return numA < numB
+		if processed[i].NumVal != processed[j].NumVal {
+			return processed[i].NumVal < processed[j].NumVal
 		}
 		return processed[i].Number < processed[j].Number
 	})
@@ -308,6 +286,7 @@ func Process(rawServers []RawServer) ([]byte, error) {
 			Load:        srv.Load,
 			IpNum:       srv.IpNum,
 			KeyIdx:      srv.KeyIndex,
+			GroupMask:   srv.GroupMask,
 			HName:       srv.HName,
 			DedupSuffix: srv.DedupSuffix,
 		}
@@ -320,15 +299,14 @@ func Process(rawServers []RawServer) ([]byte, error) {
 
 func buildJSON(keys []string, countries []CountryNode) []byte {
 	buf := make([]byte, 0, 2*1024*1024)
+	buf = append(buf, '[')
 
-	buf = append(buf, `{"k":[`...)
-	for i, k := range keys {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		buf = strconv.AppendQuote(buf, k)
+	var kb strings.Builder
+	for _, k := range keys {
+		kb.WriteString(strings.TrimRight(k, "="))
 	}
-	buf = append(buf, `],"l":[`...)
+	buf = strconv.AppendQuote(buf, kb.String())
+	buf = append(buf, ',', '[')
 
 	for i, c := range countries {
 		if i > 0 {
@@ -338,52 +316,113 @@ func buildJSON(keys []string, countries []CountryNode) []byte {
 		buf = strconv.AppendQuote(buf, c.Name)
 		buf = append(buf, ',')
 		buf = strconv.AppendQuote(buf, c.LowCode)
-		buf = append(buf, ',')
-		buf = append(buf, '[')
+		buf = append(buf, ',', '[')
+
 		for j, city := range c.Cities {
 			if j > 0 {
 				buf = append(buf, ',')
 			}
+
+			keyFreq := make(map[int]int)
+			grpFreq := make(map[int]int)
+			for _, srv := range city.Servers {
+				keyFreq[srv.KeyIdx]++
+				grpFreq[srv.GroupMask]++
+			}
+
+			defKey, defGrp := -1, -1
+			maxK, maxG := -1, -1
+			for k, v := range keyFreq {
+				if v > maxK {
+					maxK = v
+					defKey = k
+				}
+			}
+			for g, v := range grpFreq {
+				if v > maxG {
+					maxG = v
+					defGrp = g
+				}
+			}
+
 			buf = append(buf, '[')
 			buf = strconv.AppendQuote(buf, city.Name)
 			buf = append(buf, ',')
-			buf = append(buf, '[')
-			for k, srv := range city.Servers {
-				if k > 0 {
-					buf = append(buf, ',')
-				}
-				buf = append(buf, '[')
+			buf = strconv.AppendInt(buf, int64(defKey), 10)
+			buf = append(buf, ',')
+			buf = strconv.AppendInt(buf, int64(defGrp), 10)
 
-				if srv.NumIsInt {
-					buf = strconv.AppendInt(buf, int64(srv.NumInt), 10)
+			var exceptions [][]any
+			var lastNum int
+			var lastIp uint32
+
+			for _, srv := range city.Servers {
+				isExc := !srv.NumIsInt || srv.KeyIdx != defKey || srv.GroupMask != defGrp || srv.DedupSuffix != "" || srv.HName != ""
+				dIp := int64(srv.IpNum) - int64(lastIp)
+
+				if isExc {
+					packed := (-1 << 7) | (srv.Load & 0x7F)
+					buf = append(buf, ',')
+					buf = strconv.AppendInt(buf, int64(packed), 10)
+					buf = append(buf, ',')
+					buf = strconv.AppendInt(buf, dIp, 10)
+					lastIp = srv.IpNum
+
+					var idVal any
+					if srv.NumIsInt {
+						idVal = srv.NumInt
+						lastNum = srv.NumInt
+					} else {
+						idVal = srv.Number
+					}
+
+					kOvr := -1
+					if srv.KeyIdx != defKey {
+						kOvr = srv.KeyIdx
+					}
+					gOvr := -1
+					if srv.GroupMask != defGrp {
+						gOvr = srv.GroupMask
+					}
+
+					t := []any{idVal}
+					if srv.DedupSuffix != "" {
+						t = append(t, kOvr, gOvr, srv.HName, srv.DedupSuffix)
+					} else if srv.HName != "" {
+						t = append(t, kOvr, gOvr, srv.HName)
+					} else if gOvr != -1 {
+						t = append(t, kOvr, gOvr)
+					} else if kOvr != -1 {
+						t = append(t, kOvr)
+					}
+
+					exceptions = append(exceptions, t)
 				} else {
-					buf = strconv.AppendQuote(buf, srv.Number)
+					dNum := srv.NumInt - lastNum
+					packed := (dNum << 7) | (srv.Load & 0x7F)
+					buf = append(buf, ',')
+					buf = strconv.AppendInt(buf, int64(packed), 10)
+					buf = append(buf, ',')
+					buf = strconv.AppendInt(buf, dIp, 10)
+					lastNum = srv.NumInt
+					lastIp = srv.IpNum
 				}
-				buf = append(buf, ',')
-				buf = strconv.AppendInt(buf, int64(srv.Load), 10)
-				buf = append(buf, ',')
-				buf = strconv.AppendUint(buf, uint64(srv.IpNum), 10)
-				buf = append(buf, ',')
-				buf = strconv.AppendInt(buf, int64(srv.KeyIdx), 10)
-
-				if srv.DedupSuffix != "" {
-					buf = append(buf, ',')
-					buf = strconv.AppendQuote(buf, srv.HName)
-					buf = append(buf, ',')
-					buf = strconv.AppendQuote(buf, srv.DedupSuffix)
-				} else if srv.HName != "" {
-					buf = append(buf, ',')
-					buf = strconv.AppendQuote(buf, srv.HName)
-				}
-				buf = append(buf, ']')
 			}
-			buf = append(buf, ']')
+
+			if len(exceptions) > 0 {
+				buf = append(buf, ',')
+				excBytes, _ := json.Marshal(exceptions)
+				buf = append(buf, excBytes...)
+			}
+
 			buf = append(buf, ']')
 		}
+
 		buf = append(buf, ']')
 		buf = append(buf, ']')
 	}
-	buf = append(buf, `]}`...)
+
+	buf = append(buf, ']', ']')
 
 	return buf
 }

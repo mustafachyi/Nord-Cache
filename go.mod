@@ -1,3 +1,5 @@
 module nord-api
 
 go 1.26.3
+
+require github.com/andybalholm/brotli v1.2.1

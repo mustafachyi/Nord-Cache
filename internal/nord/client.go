@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const upstreamURL = "https://api.nordvpn.com/v1/servers?limit=16384&filters[servers_technologies][identifier]=wireguard_udp&fields[station]=1&fields[hostname]=1&fields[load]=1&fields[technologies.metadata]=1&fields[locations.country.name]=1&fields[locations.country.code]=1&fields[locations.country.city.name]=1&fields[specifications.identifier]=1&fields[specifications.values.value]=1"
+const upstreamURL = "https://api.nordvpn.com/v1/servers?limit=16384&filters[servers_technologies][identifier]=wireguard_udp&fields[station]=1&fields[hostname]=1&fields[load]=1&fields[technologies.metadata]=1&fields[locations.country.name]=1&fields[locations.country.code]=1&fields[locations.country.city.name]=1&fields[groups.identifier]=1"
 
 var httpClient = &http.Client{
 	Timeout: 20 * time.Second,

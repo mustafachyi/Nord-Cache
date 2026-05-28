@@ -2,12 +2,13 @@ package worker
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"log"
 	"strconv"
 	"time"
+
+	"github.com/andybalholm/brotli"
 
 	"nord-api/internal/cache"
 	"nord-api/internal/nord"
@@ -36,7 +37,7 @@ func execute(store *cache.Store) {
 		return
 	}
 
-	gzipPayload, err := compress(payload)
+	brotliPayload, err := compress(payload)
 	if err != nil {
 		log.Printf("compression failed: %v", err)
 		return
@@ -45,18 +46,15 @@ func execute(store *cache.Store) {
 	eTag := fmt.Sprintf(`"%s"`, strconv.FormatInt(time.Now().UnixNano(), 16))
 
 	store.Set(&cache.Data{
-		RawPayload:  payload,
-		GzipPayload: gzipPayload,
-		ETag:        eTag,
+		RawPayload:    payload,
+		BrotliPayload: brotliPayload,
+		ETag:          eTag,
 	})
 }
 
 func compress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	writer, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-	if err != nil {
-		return nil, err
-	}
+	writer := brotli.NewWriterLevel(&buf, brotli.BestCompression)
 
 	if _, err := writer.Write(data); err != nil {
 		return nil, err

@@ -36,10 +36,10 @@ func NewMux(store *cache.Store) *http.ServeMux {
 		w.Header().Set("Cache-Control", "public, no-transform, max-age=300")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 
-		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			w.Header().Set("Content-Encoding", "gzip")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "br") {
+			w.Header().Set("Content-Encoding", "br")
 			w.WriteHeader(http.StatusOK)
-			w.Write(data.GzipPayload)
+			w.Write(data.BrotliPayload)
 			return
 		}
 

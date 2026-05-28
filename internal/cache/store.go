@@ -3,9 +3,9 @@ package cache
 import "sync/atomic"
 
 type Data struct {
-	RawPayload  []byte
-	GzipPayload []byte
-	ETag        string
+	RawPayload    []byte
+	BrotliPayload []byte
+	ETag          string
 }
 
 type Store struct {
