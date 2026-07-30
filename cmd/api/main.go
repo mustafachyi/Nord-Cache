@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -15,37 +15,40 @@ import (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	store := cache.New()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	go worker.Start(ctx, store, 5*time.Minute)
 
-	mux := server.NewMux(store)
-
-	srv := &http.Server{
-		Addr:         ":8080",
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+	serverInstance := &http.Server{
+		Addr:              ":8080",
+		Handler:           server.NewMux(store),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
 	}
 
+	serverErrors := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server failed: %v", err)
-		}
+		serverErrors <- serverInstance.ListenAndServe()
 	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	select {
+	case <-ctx.Done():
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("server failed: %v", err)
+		}
+		return
+	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("shutdown error: %v", err)
+	if err := serverInstance.Shutdown(shutdownContext); err != nil {
+		log.Printf("server shutdown failed: %v", err)
 	}
 }

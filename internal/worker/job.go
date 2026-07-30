@@ -3,9 +3,9 @@ package worker
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"crypto/sha256"
+	"encoding/base64"
 	"log"
-	"strconv"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -15,7 +15,7 @@ import (
 )
 
 func Start(ctx context.Context, store *cache.Store, interval time.Duration) {
-	execute(store)
+	execute(ctx, store)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -25,44 +25,53 @@ func Start(ctx context.Context, store *cache.Store, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			execute(store)
+			execute(ctx, store)
 		}
 	}
 }
 
-func execute(store *cache.Store) {
-	payload, err := nord.FetchAndProcess()
+func execute(ctx context.Context, store *cache.Store) {
+	payload, err := nord.FetchAndProcess(ctx)
 	if err != nil {
-		log.Printf("sync failed: %v", err)
+		if ctx.Err() == nil {
+			log.Printf("catalog refresh failed: %v", err)
+		}
+		return
+	}
+
+	etag := createETag(payload)
+	if current := store.Get(); current != nil && current.ETag == etag {
 		return
 	}
 
 	brotliPayload, err := compress(payload)
 	if err != nil {
-		log.Printf("compression failed: %v", err)
+		log.Printf("catalog compression failed: %v", err)
 		return
 	}
-
-	eTag := fmt.Sprintf(`"%s"`, strconv.FormatInt(time.Now().UnixNano(), 16))
 
 	store.Set(&cache.Data{
 		RawPayload:    payload,
 		BrotliPayload: brotliPayload,
-		ETag:          eTag,
+		ETag:          etag,
 	})
 }
 
+func createETag(data []byte) string {
+	digest := sha256.Sum256(data)
+	return `W/"sha256-` + base64.RawURLEncoding.EncodeToString(digest[:]) + `"`
+}
+
 func compress(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	writer := brotli.NewWriterLevel(&buf, brotli.BestCompression)
+	var buffer bytes.Buffer
+	writer := brotli.NewWriterLevel(&buffer, brotli.BestCompression)
 
 	if _, err := writer.Write(data); err != nil {
 		return nil, err
 	}
-
 	if err := writer.Close(); err != nil {
 		return nil, err
 	}
 
-	return buf.Bytes(), nil
+	return buffer.Bytes(), nil
 }

@@ -36,41 +36,42 @@ type Metadata struct {
 	Value string `json:"value"`
 }
 
-type ProcessedServer struct {
-	Country        string
-	City           string
-	LowCode        string
-	Number         string
-	NumVal         int
-	KeyIndex       int
-	Load           int
-	GroupMask      int
-	RawCountryName string
-	RawCityName    string
-	DedupSuffix    string
-	IpNum          uint32
-	HName          string
+type processedServer struct {
+	country             string
+	city                string
+	countrySort         string
+	citySort            string
+	countryCode         string
+	number              string
+	numberValue         int
+	numberIsInteger     bool
+	publicKey           string
+	load                int
+	groupMask           int
+	ipNumber            uint32
+	hostnameOverride    string
+	deduplicationSuffix string
 }
 
-type ServerNode struct {
-	Number      string
-	NumInt      int
-	NumIsInt    bool
-	Load        int
-	IpNum       uint32
-	KeyIdx      int
-	GroupMask   int
-	HName       string
-	DedupSuffix string
+type serverNode struct {
+	number              string
+	numberValue         int
+	numberIsInteger     bool
+	load                int
+	ipNumber            uint32
+	keyIndex            int
+	groupMask           int
+	hostnameOverride    string
+	deduplicationSuffix string
 }
 
-type CityNode struct {
-	Name    string
-	Servers []ServerNode
+type cityNode struct {
+	name    string
+	servers []serverNode
 }
 
-type CountryNode struct {
-	Name    string
-	LowCode string
-	Cities  []CityNode
+type countryNode struct {
+	name        string
+	countryCode string
+	cities      []cityNode
 }

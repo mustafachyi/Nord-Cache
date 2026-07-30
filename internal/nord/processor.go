@@ -1,428 +1,599 @@
 package nord
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-func ipToNumeric(ip string) uint32 {
-	var val uint32
-	var octet uint32
-	var shift uint32 = 24
-	for i := 0; i < len(ip); i++ {
-		c := ip[i]
-		if c == '.' {
-			val = val | (octet << shift)
-			octet = 0
-			shift -= 8
-		} else {
-			octet = octet*10 + uint32(c-'0')
-		}
-	}
-	return val | (octet << shift)
-}
+const maxPackedNumberDelta = math.MaxInt32 >> 7
 
-func extractNumber(s string) string {
+func extractNumber(value string) string {
 	start := -1
-	end := -1
-	for i := 0; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= '0' && character <= '9' {
 			if start == -1 {
-				start = i
+				start = index
 			}
-			end = i + 1
-		} else if start != -1 {
-			break
+			continue
+		}
+
+		if start != -1 {
+			return value[start:index]
 		}
 	}
+
 	if start == -1 {
 		return ""
 	}
-	return s[start:end]
+
+	return value[start:]
 }
 
-func normalizeName(s string) string {
-	var b []byte
-	inReplace := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 32
+func normalizeName(value string) string {
+	buffer := make([]byte, 0, len(value))
+	separatorPending := false
+
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'A' && character <= 'Z' {
+			character += 'a' - 'A'
 		}
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-			b = append(b, c)
-			inReplace = false
-		} else {
-			if !inReplace && len(b) > 0 {
-				b = append(b, '_')
-				inReplace = true
+
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') {
+			if separatorPending && len(buffer) > 0 {
+				buffer = append(buffer, '_')
 			}
+			buffer = append(buffer, character)
+			separatorPending = false
+			continue
 		}
+
+		separatorPending = len(buffer) > 0
 	}
-	if len(b) > 0 && b[len(b)-1] == '_' {
-		b = b[:len(b)-1]
-	}
-	return string(b)
+
+	return string(buffer)
 }
 
-func sanitizeIdentifier(s string) string {
-	var b []byte
-	inReplace := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		isMatch := c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '#'
-		if isMatch {
-			if !inReplace {
-				b = append(b, '_')
-				inReplace = true
+func sanitizeIdentifier(value string) string {
+	buffer := make([]byte, 0, len(value))
+	separatorPending := false
+
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		isSeparator := character == ' ' || character == '\t' || character == '\n' || character == '\r' || character == '#'
+		if isSeparator {
+			if !separatorPending {
+				buffer = append(buffer, '_')
+				separatorPending = true
 			}
-		} else {
-			b = append(b, c)
-			inReplace = false
+			continue
 		}
+
+		buffer = append(buffer, character)
+		separatorPending = false
 	}
-	return string(b)
+
+	return string(buffer)
 }
 
 func Process(rawServers []RawServer) ([]byte, error) {
-	processed := make([]ProcessedServer, 0, len(rawServers))
-	var uniqueKeys []string
-	keyMap := make(map[string]int)
+	processedServers := make([]processedServer, 0, len(rawServers))
+	normalizedNameCache := make(map[string]string)
+	sanitizedIdentifierCache := make(map[string]string)
 
-	normalizeCache := make(map[string]string)
-	sanitizeCache := make(map[string]string)
-	lowCodeCache := make(map[string]string)
-
-	getNormalized := func(val string) string {
-		if res, ok := normalizeCache[val]; ok {
-			return res
+	getNormalizedName := func(value string) string {
+		if normalized, exists := normalizedNameCache[value]; exists {
+			return normalized
 		}
-		res := normalizeName(val)
-		normalizeCache[val] = res
-		return res
+
+		normalized := normalizeName(value)
+		normalizedNameCache[value] = normalized
+		return normalized
 	}
 
-	getSanitized := func(val string) string {
-		if res, ok := sanitizeCache[val]; ok {
-			return res
+	getSanitizedIdentifier := func(value string) string {
+		if sanitized, exists := sanitizedIdentifierCache[value]; exists {
+			return sanitized
 		}
-		res := sanitizeIdentifier(val)
-		sanitizeCache[val] = res
-		return res
+
+		sanitized := sanitizeIdentifier(value)
+		sanitizedIdentifierCache[value] = sanitized
+		return sanitized
 	}
 
-	getLowCode := func(val string) string {
-		if res, ok := lowCodeCache[val]; ok {
-			return res
-		}
-		res := strings.ToLower(val)
-		lowCodeCache[val] = res
-		return res
-	}
-
-	for _, server := range rawServers {
+	for index, server := range rawServers {
 		if len(server.Locations) == 0 {
 			continue
 		}
 
-		publicKey := ""
-		for _, tech := range server.Technologies {
-			for _, meta := range tech.Metadata {
-				if meta.Name == "public_key" {
-					publicKey = meta.Value
-					break
-				}
-			}
-			if publicKey != "" {
-				break
-			}
-		}
-
-		loc := server.Locations[0]
-		if loc.Country.Code == "" || publicKey == "" {
+		publicKey := findPublicKey(server.Technologies)
+		if publicKey == "" {
 			continue
 		}
-
-		keyIdx, exists := keyMap[publicKey]
-		if !exists {
-			keyIdx = len(uniqueKeys)
-			uniqueKeys = append(uniqueKeys, publicKey)
-			keyMap[publicKey] = keyIdx
+		if !isWireGuardKey(publicKey) {
+			return nil, fmt.Errorf("server %d contains an invalid public key", index)
+		}
+		if server.Load < 0 || server.Load > 100 {
+			return nil, fmt.Errorf("server %d contains an invalid load", index)
+		}
+		if !isHostname(server.Hostname) {
+			return nil, fmt.Errorf("server %d contains an invalid hostname", index)
 		}
 
-		groupMask := 0
-		for _, g := range server.Groups {
-			switch g.Identifier {
-			case "legacy_standard":
-				groupMask |= 1
-			case "legacy_p2p":
-				groupMask |= 2
-			case "legacy_dedicated_ip":
-				groupMask |= 4
-			case "legacy_onion_over_vpn":
-				groupMask |= 8
-			case "legacy_double_vpn":
-				groupMask |= 16
-			}
+		location := server.Locations[0]
+		countryCode := strings.ToLower(location.Country.Code)
+		if !isCountryCode(countryCode) {
+			return nil, fmt.Errorf("server %d contains an invalid country code", index)
 		}
 
-		lowCountryCode := getLowCode(loc.Country.Code)
-		prefix := lowCountryCode
-		if prefix == "gb" {
-			prefix = "uk"
+		countrySort := getNormalizedName(location.Country.Name)
+		citySort := getNormalizedName(location.Country.City.Name)
+		if countrySort == "" || citySort == "" {
+			return nil, fmt.Errorf("server %d contains an invalid location", index)
+		}
+		country := getSanitizedIdentifier(location.Country.Name)
+		city := getSanitizedIdentifier(location.Country.City.Name)
+
+		address, err := netip.ParseAddr(server.Station)
+		if err != nil || !address.Is4() {
+			return nil, fmt.Errorf("server %d contains an invalid IPv4 address", index)
+		}
+		addressBytes := address.As4()
+
+		number, numberValue, numberIsInteger, hostnameOverride, err := parseServerIdentity(
+			server.Hostname,
+			countryCode,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("server %d: %w", index, err)
 		}
 
-		extractedNumStr := extractNumber(server.Hostname)
-		numVal := 0
-		if extractedNumStr != "" {
-			numVal, _ = strconv.Atoi(extractedNumStr)
-		}
-
-		serverNumber := ""
-		hName := ""
-
-		if strings.HasSuffix(server.Hostname, ".nordvpn.com") {
-			base := strings.TrimSuffix(server.Hostname, ".nordvpn.com")
-			if extractedNumStr != "" && prefix+extractedNumStr == base {
-				serverNumber = extractedNumStr
-			} else {
-				serverNumber = base
-			}
-		} else {
-			if extractedNumStr != "" {
-				serverNumber = extractedNumStr
-			} else {
-				serverNumber = "wg"
-			}
-			hName = server.Hostname
-		}
-
-		ipNum := ipToNumeric(server.Station)
-
-		processed = append(processed, ProcessedServer{
-			Country:        getNormalized(loc.Country.Name),
-			City:           getNormalized(loc.Country.City.Name),
-			LowCode:        lowCountryCode,
-			Number:         serverNumber,
-			NumVal:         numVal,
-			KeyIndex:       keyIdx,
-			Load:           server.Load,
-			GroupMask:      groupMask,
-			RawCountryName: loc.Country.Name,
-			RawCityName:    loc.Country.City.Name,
-			IpNum:          ipNum,
-			HName:          hName,
+		processedServers = append(processedServers, processedServer{
+			country:          country,
+			city:             city,
+			countrySort:      countrySort,
+			citySort:         citySort,
+			countryCode:      countryCode,
+			number:           number,
+			numberValue:      numberValue,
+			numberIsInteger:  numberIsInteger,
+			publicKey:        publicKey,
+			load:             server.Load,
+			groupMask:        buildGroupMask(server.Groups),
+			ipNumber:         binary.BigEndian.Uint32(addressBytes[:]),
+			hostnameOverride: hostnameOverride,
 		})
 	}
 
-	sort.Slice(processed, func(i, j int) bool {
-		if processed[i].Country != processed[j].Country {
-			return processed[i].Country < processed[j].Country
-		}
-		if processed[i].City != processed[j].City {
-			return processed[i].City < processed[j].City
-		}
-		if processed[i].NumVal != processed[j].NumVal {
-			return processed[i].NumVal < processed[j].NumVal
-		}
-		return processed[i].Number < processed[j].Number
-	})
+	if len(processedServers) == 0 {
+		return nil, errors.New("upstream catalog contains no usable servers")
+	}
 
-	cityStart := 0
-	totalServers := len(processed)
-	for cityStart < totalServers {
+	sortProcessedServers(processedServers)
+	assignDeduplicationSuffixes(processedServers)
+
+	publicKeys, keyIndexes := buildPublicKeyIndex(processedServers)
+	countries := buildCountryNodes(processedServers, keyIndexes)
+	return buildJSON(publicKeys, countries)
+}
+
+func findPublicKey(technologies []Technology) string {
+	for _, technology := range technologies {
+		for _, metadata := range technology.Metadata {
+			if metadata.Name == "public_key" {
+				return metadata.Value
+			}
+		}
+	}
+
+	return ""
+}
+
+func isWireGuardKey(value string) bool {
+	if len(value) != 44 || value[43] != '=' {
+		return false
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	return err == nil && len(decoded) == 32
+}
+
+func isCountryCode(value string) bool {
+	if len(value) != 2 {
+		return false
+	}
+
+	for index := 0; index < len(value); index++ {
+		if value[index] < 'a' || value[index] > 'z' {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isHostname(value string) bool {
+	if len(value) == 0 || len(value) > 253 || strings.HasSuffix(value, ".") {
+		return false
+	}
+
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+
+		for index := 0; index < len(label); index++ {
+			character := label[index]
+			if (character >= 'a' && character <= 'z') ||
+				(character >= 'A' && character <= 'Z') ||
+				(character >= '0' && character <= '9') ||
+				character == '-' {
+				continue
+			}
+			return false
+		}
+	}
+
+	return true
+}
+
+func isSafeIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == '.' || character == '_' || character == '-' {
+			continue
+		}
+		return false
+	}
+
+	return true
+}
+
+func parseServerIdentity(hostname string, countryCode string) (string, int, bool, string, error) {
+	hostnamePrefix := countryCode
+	if hostnamePrefix == "gb" {
+		hostnamePrefix = "uk"
+	}
+
+	extractedNumber := extractNumber(hostname)
+	numberValue := 0
+	if extractedNumber != "" {
+		parsedNumber, err := strconv.Atoi(extractedNumber)
+		if err != nil {
+			return "", 0, false, "", errors.New("hostname contains an invalid server number")
+		}
+		numberValue = parsedNumber
+	}
+
+	if strings.HasSuffix(hostname, ".nordvpn.com") {
+		baseHostname := strings.TrimSuffix(hostname, ".nordvpn.com")
+		if extractedNumber != "" && hostnamePrefix+extractedNumber == baseHostname {
+			return extractedNumber, numberValue, true, "", nil
+		}
+		if !isSafeIdentifier(baseHostname) {
+			return "", 0, false, "", errors.New("hostname contains an invalid server identifier")
+		}
+		return baseHostname, numberValue, false, "", nil
+	}
+
+	if extractedNumber != "" {
+		return extractedNumber, numberValue, true, hostname, nil
+	}
+
+	return "wg", 0, false, hostname, nil
+}
+
+func buildGroupMask(groups []Group) int {
+	mask := 0
+	for _, group := range groups {
+		switch group.Identifier {
+		case "legacy_standard":
+			mask |= 1
+		case "legacy_p2p":
+			mask |= 2
+		case "legacy_dedicated_ip":
+			mask |= 4
+		case "legacy_onion_over_vpn":
+			mask |= 8
+		case "legacy_double_vpn":
+			mask |= 16
+		}
+	}
+	return mask
+}
+
+func sortProcessedServers(servers []processedServer) {
+	sort.Slice(servers, func(firstIndex int, secondIndex int) bool {
+		first := servers[firstIndex]
+		second := servers[secondIndex]
+
+		if first.countrySort != second.countrySort {
+			return first.countrySort < second.countrySort
+		}
+		if first.country != second.country {
+			return first.country < second.country
+		}
+		if first.countryCode != second.countryCode {
+			return first.countryCode < second.countryCode
+		}
+		if first.citySort != second.citySort {
+			return first.citySort < second.citySort
+		}
+		if first.city != second.city {
+			return first.city < second.city
+		}
+		if first.numberValue != second.numberValue {
+			return first.numberValue < second.numberValue
+		}
+		if first.number != second.number {
+			return first.number < second.number
+		}
+		if first.hostnameOverride != second.hostnameOverride {
+			return first.hostnameOverride < second.hostnameOverride
+		}
+		if first.ipNumber != second.ipNumber {
+			return first.ipNumber < second.ipNumber
+		}
+		if first.publicKey != second.publicKey {
+			return first.publicKey < second.publicKey
+		}
+		if first.groupMask != second.groupMask {
+			return first.groupMask < second.groupMask
+		}
+		return first.load < second.load
+	})
+}
+
+func assignDeduplicationSuffixes(servers []processedServer) {
+	for cityStart := 0; cityStart < len(servers); {
 		cityEnd := cityStart + 1
-		for cityEnd < totalServers &&
-			processed[cityEnd].City == processed[cityStart].City &&
-			processed[cityEnd].Country == processed[cityStart].Country {
+		for cityEnd < len(servers) &&
+			servers[cityEnd].country == servers[cityStart].country &&
+			servers[cityEnd].countryCode == servers[cityStart].countryCode &&
+			servers[cityEnd].city == servers[cityStart].city {
 			cityEnd++
 		}
 
 		nameCounts := make(map[string]int)
-		for i := cityStart; i < cityEnd; i++ {
-			baseName := processed[i].LowCode + processed[i].Number
+		for index := cityStart; index < cityEnd; index++ {
+			baseName := servers[index].countryCode + servers[index].number
 			count := nameCounts[baseName]
 			nameCounts[baseName] = count + 1
 			if count > 0 {
-				processed[i].DedupSuffix = "_" + strconv.Itoa(count)
+				servers[index].deduplicationSuffix = "_" + strconv.Itoa(count)
 			}
 		}
+
 		cityStart = cityEnd
 	}
-
-	var countries []CountryNode
-	var currentCountry *CountryNode
-	var currentCity *CityNode
-
-	for _, srv := range processed {
-		countryKey := getSanitized(srv.RawCountryName)
-		cityKey := getSanitized(srv.RawCityName)
-
-		if currentCountry == nil || currentCountry.Name != countryKey {
-			countries = append(countries, CountryNode{
-				Name:    countryKey,
-				LowCode: srv.LowCode,
-				Cities:  []CityNode{},
-			})
-			currentCountry = &countries[len(countries)-1]
-			currentCity = nil
-		}
-
-		if currentCity == nil || currentCity.Name != cityKey {
-			currentCountry.Cities = append(currentCountry.Cities, CityNode{
-				Name:    cityKey,
-				Servers: []ServerNode{},
-			})
-			currentCity = &currentCountry.Cities[len(currentCountry.Cities)-1]
-		}
-
-		numInt, err := strconv.Atoi(srv.Number)
-		node := ServerNode{
-			Number:      srv.Number,
-			NumInt:      numInt,
-			NumIsInt:    err == nil,
-			Load:        srv.Load,
-			IpNum:       srv.IpNum,
-			KeyIdx:      srv.KeyIndex,
-			GroupMask:   srv.GroupMask,
-			HName:       srv.HName,
-			DedupSuffix: srv.DedupSuffix,
-		}
-
-		currentCity.Servers = append(currentCity.Servers, node)
-	}
-
-	return buildJSON(uniqueKeys, countries), nil
 }
 
-func buildJSON(keys []string, countries []CountryNode) []byte {
-	buf := make([]byte, 0, 2*1024*1024)
-	buf = append(buf, '[')
-
-	var kb strings.Builder
-	for _, k := range keys {
-		kb.WriteString(strings.TrimRight(k, "="))
+func buildPublicKeyIndex(servers []processedServer) ([]string, map[string]int) {
+	keyFrequencies := make(map[string]int)
+	for _, server := range servers {
+		keyFrequencies[server.publicKey]++
 	}
-	buf = strconv.AppendQuote(buf, kb.String())
-	buf = append(buf, ',', '[')
 
-	for i, c := range countries {
-		if i > 0 {
-			buf = append(buf, ',')
+	keys := make([]string, 0, len(keyFrequencies))
+	for key := range keyFrequencies {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(firstIndex int, secondIndex int) bool {
+		first := keys[firstIndex]
+		second := keys[secondIndex]
+		if keyFrequencies[first] != keyFrequencies[second] {
+			return keyFrequencies[first] > keyFrequencies[second]
 		}
-		buf = append(buf, '[')
-		buf = strconv.AppendQuote(buf, c.Name)
-		buf = append(buf, ',')
-		buf = strconv.AppendQuote(buf, c.LowCode)
-		buf = append(buf, ',', '[')
+		return first < second
+	})
 
-		for j, city := range c.Cities {
-			if j > 0 {
-				buf = append(buf, ',')
+	indexes := make(map[string]int, len(keys))
+	for index, key := range keys {
+		indexes[key] = index
+	}
+
+	return keys, indexes
+}
+
+func buildCountryNodes(servers []processedServer, keyIndexes map[string]int) []countryNode {
+	countries := make([]countryNode, 0)
+
+	for _, server := range servers {
+		if len(countries) == 0 ||
+			countries[len(countries)-1].name != server.country ||
+			countries[len(countries)-1].countryCode != server.countryCode {
+			countries = append(countries, countryNode{
+				name:        server.country,
+				countryCode: server.countryCode,
+			})
+		}
+
+		country := &countries[len(countries)-1]
+		if len(country.cities) == 0 || country.cities[len(country.cities)-1].name != server.city {
+			country.cities = append(country.cities, cityNode{name: server.city})
+		}
+
+		city := &country.cities[len(country.cities)-1]
+		city.servers = append(city.servers, serverNode{
+			number:              server.number,
+			numberValue:         server.numberValue,
+			numberIsInteger:     server.numberIsInteger,
+			load:                server.load,
+			ipNumber:            server.ipNumber,
+			keyIndex:            keyIndexes[server.publicKey],
+			groupMask:           server.groupMask,
+			hostnameOverride:    server.hostnameOverride,
+			deduplicationSuffix: server.deduplicationSuffix,
+		})
+	}
+
+	return countries
+}
+
+func buildJSON(keys []string, countries []countryNode) ([]byte, error) {
+	buffer := make([]byte, 0, 2*1024*1024)
+	buffer = append(buffer, '[')
+
+	var keyCollection strings.Builder
+	keyCollection.Grow(len(keys) * 43)
+	for _, key := range keys {
+		keyCollection.WriteString(strings.TrimSuffix(key, "="))
+	}
+	buffer = strconv.AppendQuote(buffer, keyCollection.String())
+	buffer = append(buffer, ',', '[')
+
+	for countryIndex, country := range countries {
+		if countryIndex > 0 {
+			buffer = append(buffer, ',')
+		}
+
+		buffer = append(buffer, '[')
+		buffer = strconv.AppendQuote(buffer, country.name)
+		buffer = append(buffer, ',')
+		buffer = strconv.AppendQuote(buffer, country.countryCode)
+		buffer = append(buffer, ',', '[')
+
+		for cityIndex, city := range country.cities {
+			if cityIndex > 0 {
+				buffer = append(buffer, ',')
 			}
 
-			keyFreq := make(map[int]int)
-			grpFreq := make(map[int]int)
-			for _, srv := range city.Servers {
-				keyFreq[srv.KeyIdx]++
-				grpFreq[srv.GroupMask]++
-			}
+			defaultKeyIndex := selectDefault(city.servers, func(server serverNode) int {
+				return server.keyIndex
+			})
+			defaultGroupMask := selectDefault(city.servers, func(server serverNode) int {
+				return server.groupMask
+			})
 
-			defKey, defGrp := -1, -1
-			maxK, maxG := -1, -1
-			for k, v := range keyFreq {
-				if v > maxK {
-					maxK = v
-					defKey = k
-				}
-			}
-			for g, v := range grpFreq {
-				if v > maxG {
-					maxG = v
-					defGrp = g
-				}
-			}
+			buffer = append(buffer, '[')
+			buffer = strconv.AppendQuote(buffer, city.name)
+			buffer = append(buffer, ',')
+			buffer = strconv.AppendInt(buffer, int64(defaultKeyIndex), 10)
+			buffer = append(buffer, ',')
+			buffer = strconv.AppendInt(buffer, int64(defaultGroupMask), 10)
 
-			buf = append(buf, '[')
-			buf = strconv.AppendQuote(buf, city.Name)
-			buf = append(buf, ',')
-			buf = strconv.AppendInt(buf, int64(defKey), 10)
-			buf = append(buf, ',')
-			buf = strconv.AppendInt(buf, int64(defGrp), 10)
+			exceptions := make([][]any, 0)
+			lastNumber := 0
+			var lastIP uint32
 
-			var exceptions [][]any
-			var lastNum int
-			var lastIp uint32
+			for _, server := range city.servers {
+				isException := !server.numberIsInteger ||
+					server.keyIndex != defaultKeyIndex ||
+					server.groupMask != defaultGroupMask ||
+					server.deduplicationSuffix != "" ||
+					server.hostnameOverride != ""
+				ipDelta := int64(server.ipNumber) - int64(lastIP)
 
-			for _, srv := range city.Servers {
-				isExc := !srv.NumIsInt || srv.KeyIdx != defKey || srv.GroupMask != defGrp || srv.DedupSuffix != "" || srv.HName != ""
-				dIp := int64(srv.IpNum) - int64(lastIp)
+				if isException {
+					packedValue := (-1 << 7) | (server.load & 0x7f)
+					buffer = appendPackedServer(buffer, packedValue, ipDelta)
+					lastIP = server.ipNumber
 
-				if isExc {
-					packed := (-1 << 7) | (srv.Load & 0x7F)
-					buf = append(buf, ',')
-					buf = strconv.AppendInt(buf, int64(packed), 10)
-					buf = append(buf, ',')
-					buf = strconv.AppendInt(buf, dIp, 10)
-					lastIp = srv.IpNum
-
-					var idVal any
-					if srv.NumIsInt {
-						idVal = srv.NumInt
-						lastNum = srv.NumInt
+					var identifier any
+					if server.numberIsInteger {
+						identifier = server.numberValue
+						lastNumber = server.numberValue
 					} else {
-						idVal = srv.Number
+						identifier = server.number
 					}
 
-					kOvr := -1
-					if srv.KeyIdx != defKey {
-						kOvr = srv.KeyIdx
+					keyOverride := -1
+					if server.keyIndex != defaultKeyIndex {
+						keyOverride = server.keyIndex
 					}
-					gOvr := -1
-					if srv.GroupMask != defGrp {
-						gOvr = srv.GroupMask
-					}
-
-					t := []any{idVal}
-					if srv.DedupSuffix != "" {
-						t = append(t, kOvr, gOvr, srv.HName, srv.DedupSuffix)
-					} else if srv.HName != "" {
-						t = append(t, kOvr, gOvr, srv.HName)
-					} else if gOvr != -1 {
-						t = append(t, kOvr, gOvr)
-					} else if kOvr != -1 {
-						t = append(t, kOvr)
+					groupOverride := -1
+					if server.groupMask != defaultGroupMask {
+						groupOverride = server.groupMask
 					}
 
-					exceptions = append(exceptions, t)
-				} else {
-					dNum := srv.NumInt - lastNum
-					packed := (dNum << 7) | (srv.Load & 0x7F)
-					buf = append(buf, ',')
-					buf = strconv.AppendInt(buf, int64(packed), 10)
-					buf = append(buf, ',')
-					buf = strconv.AppendInt(buf, dIp, 10)
-					lastNum = srv.NumInt
-					lastIp = srv.IpNum
+					exception := []any{identifier}
+					switch {
+					case server.deduplicationSuffix != "":
+						exception = append(
+							exception,
+							keyOverride,
+							groupOverride,
+							server.hostnameOverride,
+							server.deduplicationSuffix,
+						)
+					case server.hostnameOverride != "":
+						exception = append(exception, keyOverride, groupOverride, server.hostnameOverride)
+					case groupOverride != -1:
+						exception = append(exception, keyOverride, groupOverride)
+					case keyOverride != -1:
+						exception = append(exception, keyOverride)
+					}
+					exceptions = append(exceptions, exception)
+					continue
 				}
+
+				numberDelta := server.numberValue - lastNumber
+				if numberDelta < 0 || numberDelta > maxPackedNumberDelta {
+					return nil, errors.New("server number delta exceeds the packed format")
+				}
+
+				packedValue := (numberDelta << 7) | (server.load & 0x7f)
+				buffer = appendPackedServer(buffer, packedValue, ipDelta)
+				lastNumber = server.numberValue
+				lastIP = server.ipNumber
 			}
 
 			if len(exceptions) > 0 {
-				buf = append(buf, ',')
-				excBytes, _ := json.Marshal(exceptions)
-				buf = append(buf, excBytes...)
+				exceptionJSON, err := json.Marshal(exceptions)
+				if err != nil {
+					return nil, fmt.Errorf("encode server exceptions: %w", err)
+				}
+				buffer = append(buffer, ',')
+				buffer = append(buffer, exceptionJSON...)
 			}
 
-			buf = append(buf, ']')
+			buffer = append(buffer, ']')
 		}
 
-		buf = append(buf, ']')
-		buf = append(buf, ']')
+		buffer = append(buffer, ']', ']')
 	}
 
-	buf = append(buf, ']', ']')
+	buffer = append(buffer, ']', ']')
+	return buffer, nil
+}
 
-	return buf
+func selectDefault(servers []serverNode, valueOf func(serverNode) int) int {
+	counts := make(map[int]int)
+	selectedValue := 0
+	selectedCount := -1
+
+	for _, server := range servers {
+		value := valueOf(server)
+		counts[value]++
+		count := counts[value]
+		if count > selectedCount || (count == selectedCount && value < selectedValue) {
+			selectedValue = value
+			selectedCount = count
+		}
+	}
+
+	return selectedValue
+}
+
+func appendPackedServer(buffer []byte, packedValue int, ipDelta int64) []byte {
+	buffer = append(buffer, ',')
+	buffer = strconv.AppendInt(buffer, int64(packedValue), 10)
+	buffer = append(buffer, ',')
+	return strconv.AppendInt(buffer, ipDelta, 10)
 }

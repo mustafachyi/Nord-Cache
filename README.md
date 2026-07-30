@@ -1,36 +1,40 @@
 # Nord Cache
 
-A caching proxy for the NordVPN WireGuard server list. Fetches, filters, and serves an aggressively compacted, bitwise-packed server index refreshed every 5 minutes.
+Nord Cache fetches NordVPN WireGuard server metadata, validates and compacts it, and serves the resulting catalog to NordGen.
 
-## Background
+## Architecture
 
-Built to support [NordVPN WireGuard Config Generator](https://github.com/mustafachyi/NordVPN-WireGuard-Config-Generator). Processing the raw NordVPN API response directly inside the Cloudflare Workers free tier was exceeding the 10ms CPU time limit. Nord Cache offloads that work to a dedicated service and exposes a pre-processed, type-bound, delta-encoded payload the worker can consume within budget.
+- Polls the NordVPN server API every five minutes.
+- Retains only servers with a location and valid WireGuard public key.
+- Validates hostnames, IPv4 addresses, loads, country codes, and public keys before publishing a new catalog.
+- Produces deterministic output independent of upstream server ordering.
+- Stores raw and Brotli-encoded representations in memory behind an atomic pointer.
+- Uses a weak SHA-256 content ETag shared by the equivalent raw and Brotli representations.
+- Skips Brotli recompression and store replacement when the processed catalog is unchanged.
+- Keeps the previous valid catalog available when a refresh fails.
 
-## Operation
+The service has no persistent state. After a restart, `/api/servers` returns `503 Service Unavailable` until the first successful refresh completes.
 
-- Polls the NordVPN API for all `wireguard_udp` servers.
-- Filters to servers with a valid public key and country code.
-- Extracts server group designations via a bitmask representation.
-- Compresses the dataset using delta encoding, default hoisting, bitwise packing, and V8-optimized flat arrays.
-- Serves the result with Brotli encoding, ETag validation, and CORS headers.
+## Output format
 
-## Output Format
-
-The payload utilizes a highly normalized nested array structure to eliminate JSON structural overhead and force the V8 JavaScript engine to utilize `PACKED_SMI_ELEMENTS` (contiguous small integers) for maximum parsing iteration speed.
+The response body is a compact JSON tuple:
 
 ```json
 [
-  "kjAOz...Wed9wMVSa6...ExUs...",
+  "concatenated-public-keys",
   [
     [
-      "CountryName", "cc",
+      "Country_Name",
+      "cc",
       [
         [
-          "CityName", <default_key_idx>, <default_group_mask>,
-          <packed_0>, <dip_0>,
-          <packed_1>, <dip_1>,
+          "City_Name",
+          0,
+          1,
+          12810,
+          16843009,
           [
-            [<exception_id>, <key_ovr>, <grp_ovr>, "hname", "dedup"]
+            ["identifier", -1, -1, "hostname", "_1"]
           ]
         ]
       ]
@@ -39,30 +43,46 @@ The payload utilizes a highly normalized nested array structure to eliminate JSO
 ]
 ```
 
-### Decoding Mechanics
+### Public key collection
 
-#### 1. Monolithic Key String
-The first element of the root array is a single continuous string containing all unique WireGuard public keys. The `=` base64 padding is stripped. To retrieve a key by its index, extract a 43-character substring and append `=`.
+The first tuple element concatenates all unique WireGuard public keys after removing each key's trailing `=` padding. Every key occupies 43 characters. Consumers recover a key by slicing the string at `keyIndex * 43` and appending `=`.
 
-#### 2. City Node
-Each city array starts with the city name, the default `key_idx`, and the default `group_mask` for servers in that city. Following these three elements is a flat sequence of integers. 
+### Country and city nodes
 
-#### 3. Flat Server Integers (`packed` and `dip`)
-Every server is represented by two sequential integers in the array:
-- `dip`: The numeric delta from the preceding server's numeric IP.
-- `packed`: A bitwise combination of the numeric hostname delta (`dNum`) and the server load (`Load`).
+Each country is encoded as:
 
-`Packed = (dNum << 7) | Load`.
-- `Load = Packed & 0x7F`
-- `dNum = Packed >> 7`
+```text
+[countryName, countryCode, cities]
+```
 
-#### 4. Exceptions Array
-If `Packed < 0`, it acts as a negative-space exception signal.
-- The `Load` is still derived via `Packed & 0x7F`.
-- The server's identifier and metadata overrides are located in the trailing exceptions array appended to the end of the city block. The V8 parser can safely break the integer loop using a `typeof === 'number'` boundary check. Exception parameters omit missing values based on array length.
+Each city starts with:
 
-### Group Mask
-The `group_mask` maps server categories via bitwise addition:
+```text
+[cityName, defaultKeyIndex, defaultGroupMask, packedServerData...]
+```
+
+The default key and group values are selected deterministically by frequency and then by the lowest numeric value when frequencies tie.
+
+### Packed server data
+
+Each normal server uses two integers:
+
+```text
+[packedNumberAndLoad, ipDelta]
+```
+
+The packed value is:
+
+```text
+(numberDelta << 7) | load
+```
+
+The low seven bits contain the load. The remaining bits contain the numeric server-number delta.
+
+A negative packed value marks an exception. Its corresponding entry in the city's trailing exception array supplies the server identifier and any key, group, hostname, or deduplication overrides.
+
+### Group mask
+
 - `1`: `legacy_standard`
 - `2`: `legacy_p2p`
 - `4`: `legacy_dedicated_ip`
@@ -72,35 +92,54 @@ The `group_mask` maps server categories via bitwise addition:
 ## Endpoints
 
 | Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Returns `200 OK` |
-| `GET` | `/api/servers` | Returns the processed server list |
+|---|---|---|
+| `GET` | `/health` | Liveness response |
+| `HEAD` | `/health` | Liveness headers |
+| `GET` | `/api/servers` | Processed catalog |
+| `HEAD` | `/api/servers` | Catalog headers without a body |
+| `OPTIONS` | `/api/servers` | CORS preflight response |
 
-`/api/servers` supports `If-None-Match` and `Accept-Encoding: br`. Returns `503` until the first fetch completes.
+`/api/servers` supports `If-None-Match` and Brotli content negotiation. It returns `503` until the first successful refresh.
 
-## Running
+## Requirements
 
-**Docker**
+- Go 1.26.5
+- Docker, when building the container image
 
-```sh
-docker build -t nord-cache .
-docker run -p 8080:8080 nord-cache
-```
+## Run locally
 
-**Local**
-
-```sh
+```cmd
 go run ./cmd/api
 ```
 
-Requires Go 1.26.3.
+## Test
 
-## Configuration
+```cmd
+go test ./...
+```
 
-All parameters are hardcoded. Edit the relevant file to change them.
+```cmd
+go vet ./...
+```
 
-| Parameter | Value | File |
-|-----------|-------|------|
-| Listen port | `:8080` | `cmd/api/main.go` |
+## Build and run with Docker
+
+```cmd
+docker build --pull -t nord-cache:1.26.5 .
+```
+
+```cmd
+docker run --rm -p 8080:8080 nord-cache:1.26.5
+```
+
+## Fixed configuration
+
+| Setting | Value | File |
+|---|---:|---|
+| Listen address | `:8080` | `cmd/api/main.go` |
 | Refresh interval | `5m` | `cmd/api/main.go` |
 | Upstream request timeout | `20s` | `internal/nord/client.go` |
+| Upstream response limit | `64 MiB` | `internal/nord/client.go` |
+| Read-header timeout | `5s` | `cmd/api/main.go` |
+| Read timeout | `10s` | `cmd/api/main.go` |
+| Write timeout | `15s` | `cmd/api/main.go` |
